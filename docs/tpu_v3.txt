@@ -1,0 +1,844 @@
+`timescale 1ns / 1ps
+
+module tpu_controller (
+    input wire clk,
+    input wire rst,
+    
+    // --- UART RX INTERFACE ---
+    input wire rx_empty,
+    input wire [7:0] rx_data,
+    output reg rx_rd,
+    
+    // --- UART TX INTERFACE ---
+    input wire tx_full,
+    output reg tx_wr,
+    output reg [7:0] tx_data,
+    
+    // --- MMU / PPU INTERFACE ---
+    output reg load_wt,
+    output reg [127:0] flat_weights,
+    output reg [31:0] flat_data_in,
+    input wire [31:0] flat_ppu_out
+);
+
+    localparam S_IDLE       = 3'd0;
+    localparam S_GET_WTS    = 3'd1;
+    localparam S_GET_DATA   = 3'd2;
+    localparam S_BURST_MATH = 3'd3;
+    localparam S_TX_RESULTS = 3'd4;
+    
+    reg [2:0] state;
+    reg [7:0] byte_count;
+    reg [3:0] math_cycle;
+    
+    reg [7:0] in_buffer  [0:15]; 
+    reg [7:0] out_buffer [0:15];
+
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            state <= S_IDLE;
+            rx_rd <= 0;
+            tx_wr <= 0;
+            load_wt <= 0;
+            byte_count <= 0;
+            math_cycle <= 0;
+            flat_data_in <= 0;
+        end else begin
+            rx_rd <= 0;
+            tx_wr <= 0;
+            load_wt <= 0;
+            
+            case (state)
+                S_IDLE: begin
+                    if (!rx_empty) begin
+                        rx_rd <= 1;
+                        if (rx_data == 8'hAA) begin
+                            state <= S_GET_WTS;
+                            byte_count <= 0;
+                        end else if (rx_data == 8'hBB) begin
+                            state <= S_GET_DATA;
+                            byte_count <= 0;
+                        end
+                    end
+                end
+                
+                S_GET_WTS: begin
+                    if (!rx_empty && !rx_rd) begin
+                        rx_rd <= 1;
+                        flat_weights <= {flat_weights[119:0], rx_data};
+                        byte_count <= byte_count + 1;
+                        
+                        if (byte_count == 15) begin
+                            load_wt <= 1;
+                            state <= S_IDLE;
+                        end
+                    end
+                end
+                
+                S_GET_DATA: begin
+                    if (!rx_empty && !rx_rd) begin
+                        rx_rd <= 1;
+                        in_buffer[byte_count] <= rx_data;
+                        byte_count <= byte_count + 1;
+                        
+                        if (byte_count == 15) begin
+                            state <= S_BURST_MATH;
+                            math_cycle <= 0;
+                        end
+                    end
+                end
+                
+                S_BURST_MATH: begin
+                    math_cycle <= math_cycle + 1;
+                    
+                    // 1. PUSH THE DIAGONAL WAVE INTO LEFT DOORS
+                    case (math_cycle)
+                        0: flat_data_in <= {8'd0, 8'd0, 8'd0, in_buffer[0]};
+                        1: flat_data_in <= {8'd0, 8'd0, in_buffer[4], in_buffer[1]};
+                        2: flat_data_in <= {8'd0, in_buffer[8], in_buffer[5], in_buffer[2]};
+                        3: flat_data_in <= {in_buffer[12], in_buffer[9], in_buffer[6], in_buffer[3]};
+                        4: flat_data_in <= {in_buffer[13], in_buffer[10], in_buffer[7], 8'd0};
+                        5: flat_data_in <= {in_buffer[14], in_buffer[11], 8'd0, 8'd0};
+                        6: flat_data_in <= {in_buffer[15], 8'd0, 8'd0, 8'd0};
+                        default: flat_data_in <= 32'd0;
+                    endcase
+                    
+                    // 2. THE DESKEW BUFFER: CATCH THE SLANTED WAVE
+                    if (math_cycle == 6) begin
+                        out_buffer[0]  <= flat_ppu_out[7:0];   // [Row0, Col0]
+                    end
+                    if (math_cycle == 7) begin
+                        out_buffer[4]  <= flat_ppu_out[7:0];   // [Row1, Col0]
+                        out_buffer[1]  <= flat_ppu_out[15:8];  // [Row0, Col1]
+                    end
+                    if (math_cycle == 8) begin
+                        out_buffer[8]  <= flat_ppu_out[7:0];   // [Row2, Col0]
+                        out_buffer[5]  <= flat_ppu_out[15:8];  // [Row1, Col1]
+                        out_buffer[2]  <= flat_ppu_out[23:16]; // [Row0, Col2]
+                    end
+                    if (math_cycle == 9) begin
+                        out_buffer[12] <= flat_ppu_out[7:0];   // [Row3, Col0]
+                        out_buffer[9]  <= flat_ppu_out[15:8];  // [Row2, Col1]
+                        out_buffer[6]  <= flat_ppu_out[23:16]; // [Row1, Col2]
+                        out_buffer[3]  <= flat_ppu_out[31:24]; // [Row0, Col3]
+                    end
+                    if (math_cycle == 10) begin
+                        out_buffer[13] <= flat_ppu_out[15:8];  // [Row3, Col1]
+                        out_buffer[10] <= flat_ppu_out[23:16]; // [Row2, Col2]
+                        out_buffer[7]  <= flat_ppu_out[31:24]; // [Row1, Col3]
+                    end
+                    if (math_cycle == 11) begin
+                        out_buffer[14] <= flat_ppu_out[23:16]; // [Row3, Col2]
+                        out_buffer[11] <= flat_ppu_out[31:24]; // [Row2, Col3]
+                    end
+                    if (math_cycle == 12) begin
+                        out_buffer[15] <= flat_ppu_out[31:24]; // [Row3, Col3]
+                        state <= S_TX_RESULTS;
+                        byte_count <= 0;
+                    end
+                end
+                
+                S_TX_RESULTS: begin
+                    if (!tx_full && !tx_wr) begin
+                        tx_wr <= 1; 
+                        tx_data <= out_buffer[byte_count];
+                        byte_count <= byte_count + 1;
+                        
+                        if (byte_count == 15) begin
+                            state <= S_IDLE; 
+                        end
+                    end
+                end
+            endcase
+        end
+    end
+endmodule`timescale 1ns / 1ps
+
+module tb_top_tpu();
+
+    // 1. SYSTEM TIMING PARAMETERS
+    localparam CLK_PERIOD = 20;   // 50 MHz Clock -> 20ns period
+    localparam BIT_TIME = 8680;   // 115200 Baud -> 8680 ns per bit
+
+    reg clk;
+    reg rst;
+    reg rx;
+    wire tx;
+
+    top_tpu dut (
+        .clk(clk),
+        .rst(rst),
+        .rx(rx),
+        .tx(tx)
+    );
+
+    initial begin
+        clk = 0;
+        forever #(CLK_PERIOD / 2) clk = ~clk;
+    end
+    
+    // Mimics Python sending a byte
+    task send_uart_byte(input [7:0] data);
+        integer i;
+        begin
+            rx = 0; // Start bit
+            #(BIT_TIME);
+            
+            for (i = 0; i < 8; i = i + 1) begin
+                rx = data[i]; // 8 Data bits
+                #(BIT_TIME);
+            end
+            
+            rx = 1; // Stop bit
+            #(BIT_TIME);
+        end
+    endtask
+
+    // Mimics Python reading a byte
+    task receive_uart_byte(output [7:0] data);
+        integer i;
+        begin
+            wait(tx == 0); // Wait for Start bit
+            #(BIT_TIME / 2); // Shift to the middle of the "eye"
+            
+            if (tx !== 0) $display("ERROR: False start bit!");
+            
+            #(BIT_TIME);
+            
+            for (i = 0; i < 8; i = i + 1) begin
+                data[i] = tx; // Sample 8 Data bits
+                #(BIT_TIME);
+            end
+            
+            wait(tx == 1); // Wait for Stop bit
+        end
+    endtask
+
+    integer idx;
+    reg [7:0] captured_data [0:15];
+    reg [7:0] expected_data [0:15];
+    int errors = 0;
+
+    initial begin
+        rx = 1; 
+        rst = 1;
+        
+        $display("=================================================");
+        $display("=== STARTING FULL SYSTEM TPU VERIFICATION     ===");
+        $display("=================================================");
+        
+        // --- GTKWAVE DUMP COMMANDS ---
+        $dumpfile("top_tpu_full.vcd");
+        $dumpvars(0, tb_top_tpu);
+
+        #(CLK_PERIOD * 10);
+        rst = 0;
+        #(CLK_PERIOD * 10);
+
+        // ---------------------------------------------------------
+        // PHASE 1: LOAD WEIGHTS
+        // ---------------------------------------------------------
+        $display("[%0t] Sending Opcode 0xAA (LOAD_WEIGHTS)", $time);
+        send_uart_byte(8'hAA);
+        
+        for (idx = 0; idx < 16; idx = idx + 1) begin
+            // Sending an Identity Matrix
+            if (idx == 0 || idx == 5 || idx == 10 || idx == 15)
+                send_uart_byte(8'h01); 
+            else
+                send_uart_byte(8'h00); 
+        end
+
+        #(BIT_TIME * 5); 
+        
+        // ---------------------------------------------------------
+        // PHASE 2: SEND PIXEL DATA 
+        // ---------------------------------------------------------
+        $display("[%0t] Sending Opcode 0xBB (COMPUTE)", $time);
+        send_uart_byte(8'hBB);
+        
+        for (idx = 0; idx < 16; idx = idx + 1) begin
+            send_uart_byte(idx + 1); 
+        end
+
+        // ---------------------------------------------------------
+        // PHASE 3: CAPTURE RESULTS
+        // ---------------------------------------------------------
+        $display("[%0t] Waiting for TPU processing...", $time);
+        
+        // With the deskew buffer fixed, an identity matrix 
+        // will perfectly pass the 1-16 pixels directly through.
+        for (idx = 0; idx < 16; idx = idx + 1) begin
+            expected_data[idx] = idx + 1;
+        end
+        
+        for (idx = 0; idx < 16; idx = idx + 1) begin
+            receive_uart_byte(captured_data[idx]);
+            $display("[%0t] RX Byte %0d: %0d | Expected: %0d", 
+                     $time, idx, captured_data[idx], expected_data[idx]);
+            
+            if (captured_data[idx] !== expected_data[idx]) begin
+                errors = errors + 1;
+                $display(" ---> MISMATCH!");
+            end
+        end
+
+        $display("=================================================");
+        if (errors == 0)
+            $display("=== TEST PASSED! The TPU is geometrically perfect. ===");
+        else
+            $display("=== TEST FAILED with %0d errors.                   ===", errors);
+        $display("=================================================");
+        
+        # (BIT_TIME * 10);
+        $finish;
+    end
+
+    // Safety timeout
+    initial begin
+        #(100_000_000); 
+        $display("CRITICAL ERROR: Simulation timed out! FSM hung.");
+        $finish;
+    end
+
+endmodule`timescale 1ns / 1ps
+
+module mac_pe #(
+    // --- Fully Parametrizable Widths ---
+    parameter D_WIDTH   = 8,   // DATA (Pixel) width (e.g., 8-bit)
+    parameter W_WIDTH   = 8,   // Weight width (e.g., 8-bit signed)
+    parameter ACC_WIDTH = 16   // Accumulator width (Large enough to prevent overflow)
+)(
+    input  wire clk,
+    input  wire rst,
+
+    // --- Weight Pre-loading ---
+    input  wire                 load_wt,   // High when loading the filter matrix
+    input  wire signed [W_WIDTH-1:0] wt_in,     // The weight to save inside this PE
+
+    // --- Systolic Data Flow (The Wave) ---
+    input  wire signed [D_WIDTH-1:0] data_in,    // Pixel coming from the LEFT
+    input  wire signed [ACC_WIDTH-1:0] acc_in,  // Partial sum coming from the TOP
+
+    output reg  signed [D_WIDTH-1:0] data_out,   // Pixel passing to the RIGHT
+    output reg  signed [ACC_WIDTH-1:0] acc_out  // New sum passing to the BOTTOM
+);
+
+    // Internal register to hold this specific blue box's weight
+    reg signed [W_WIDTH-1:0] weight_reg;
+
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            weight_reg <= 0;
+            data_out    <= 0;
+            acc_out    <= 0;
+        end else begin
+            
+            // 1. Weight-Stationary Load
+            // When the TPU gets an opcode, it loads the weights first.
+            if (load_wt) begin
+                weight_reg <= wt_in;
+            end
+
+            // 2. Pass Data to the Right (The Horizontal Wave)
+            // It takes exactly 1 clock cycle for the pixel to move through the box
+            data_out <= data_in
+    ; 
+
+            // 3. The MAC Math (The Vertical Wave)
+            // Multiply the pixel by the weight, add it to the sum from above, 
+            // and pass the result down to the next row on the clock edge.
+            acc_out <= acc_in + (data_in* weight_reg);
+
+        end
+    end
+
+endmodule`timescale 1ns / 1ps
+
+module systolic_array #(
+    parameter D_WIDTH = 9,   // 9-bits to force unsigned pixels to positive signed logic
+    parameter W_WIDTH = 8,
+    parameter ACC_WIDTH = 18 
+)(
+    input wire clk, 
+    input wire rst, 
+    input wire load_wt,
+
+    input wire [127:0] flat_weights,
+    input wire [31:0]  flat_data_in,
+    output wire [71:0] flat_acc_out
+);
+
+    // =========================================================
+    // 0. UNPACKING THE FLAT CABLES INTO 2D ARRAYS
+    // =========================================================
+    wire signed [W_WIDTH-1:0] wt_in [0:15];
+    wire signed [D_WIDTH-1:0] data_in [0:3];
+    wire signed [ACC_WIDTH-1:0] acc_out [0:3];
+
+    // Unpack 32-bit data cable and zero-pad to 9-bit signed positive
+    assign data_in[0] = {1'b0, flat_data_in[7:0]};
+    assign data_in[1] = {1'b0, flat_data_in[15:8]};
+    assign data_in[2] = {1'b0, flat_data_in[23:16]};
+    assign data_in[3] = {1'b0, flat_data_in[31:24]};
+
+    // Unpack 128-bit weight cable into sixteen 8-bit blocks
+    genvar w;
+    generate
+        for (w = 0; w < 16; w = w + 1) begin : unpack_wt
+            assign wt_in[w] = flat_weights[(w*8)+7 : (w*8)];
+        end
+    endgenerate
+
+    assign flat_acc_out = {acc_out[3], acc_out[2], acc_out[1], acc_out[0]};
+
+    // =========================================================
+    // 1. CREATING THE WIRE GRID 
+    // =========================================================
+    wire signed [D_WIDTH-1:0] data_link [0:3][0:4];
+    wire signed [ACC_WIDTH-1:0] acc_link [0:4][0:3]; 
+
+    // =========================================================
+    // 2. WIRING THE EDGES TO THE OUTSIDE WORLD
+    // =========================================================
+    genvar i;
+    generate
+        for (i = 0; i < 4; i = i + 1) begin : edge_assign
+            assign data_link[i][0] = data_in[i];
+            assign acc_link[0][i] = 0;         
+            assign acc_out[i] = acc_link[4][i]; 
+        end
+    endgenerate
+
+    // =========================================================
+    // 3. STAMPING OUT THE 16 MAC PEs
+    // =========================================================
+    genvar r, c;
+    generate
+        for (r = 0; r < 4; r = r + 1) begin : row
+            for (c = 0; c < 4; c = c + 1) begin : col
+                
+                mac_pe #(
+                    .D_WIDTH(D_WIDTH), .W_WIDTH(W_WIDTH), .ACC_WIDTH(ACC_WIDTH)
+                ) pe_inst (
+                    .clk(clk),
+                    .rst(rst),
+                    .load_wt(load_wt),
+                    .wt_in(wt_in[r*4 + c]),         
+                    .data_in(data_link[r][c]),      
+                    .data_out(data_link[r][c+1]),   
+                    .acc_in(acc_link[r][c]),        
+                    .acc_out(acc_link[r+1][c])      
+                );
+            end
+        end
+    endgenerate
+
+endmodule`timescale 1ns / 1ps
+
+module ppu #(
+    parameter ACC_WIDTH = 18,
+    parameter OUT_WIDTH = 8
+)(
+    input wire clk,
+    input wire rst,
+    
+    // The 72-bit fat cable coming from the bottom of the MMU (4 columns * 18 bits)
+    input wire [(ACC_WIDTH * 4) - 1 : 0] flat_acc_in,
+    
+    // The 32-bit shrunk cable going to the Output Memory/UART (4 columns * 8 bits)
+    output reg [(OUT_WIDTH * 4) - 1 : 0] flat_ppu_out
+);
+
+    // 1. Unpack the fat 18-bit wires from the MMU
+    wire signed [17:0] col0_in = flat_acc_in[17:0];
+    wire signed [17:0] col1_in = flat_acc_in[35:18];
+    wire signed [17:0] col2_in = flat_acc_in[53:36];
+    wire signed [17:0] col3_in = flat_acc_in[71:54];
+
+    // 2. Combinational Logic: ReLU + Clamping
+    // - If it's less than 0 (negative), output 0.
+    // - If it's greater than 255, output 255.
+    // - Otherwise, just safely take the bottom 8 bits.
+    wire [7:0] col0_processed = (col0_in < 0) ? 8'd0 : ((col0_in > 255) ? 8'd255 : col0_in[7:0]);
+    wire [7:0] col1_processed = (col1_in < 0) ? 8'd0 : ((col1_in > 255) ? 8'd255 : col1_in[7:0]);
+    wire [7:0] col2_processed = (col2_in < 0) ? 8'd0 : ((col2_in > 255) ? 8'd255 : col2_in[7:0]);
+    wire [7:0] col3_processed = (col3_in < 0) ? 8'd0 : ((col3_in > 255) ? 8'd255 : col3_in[7:0]);
+
+    // 3. Sequential Logic: Pack them up and sync to the clock!
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            flat_ppu_out <= 0;
+        end else begin
+            // Pack the 4 processed 8-bit bytes into a single 32-bit output cable
+            flat_ppu_out <= {col3_processed, col2_processed, col1_processed, col0_processed};
+        end
+    end
+
+endmodule`timescale 1ns / 1ps
+
+module uart #(
+    parameter DBIT = 8,     // data bits ; tells rx and tx how many bits to wait before declaring "finish" 
+    parameter SB_TICK = 16,   // no of tick to process the Stop bit at the end of the transmission
+                               // 16x Oversampling used by uart recieviers
+    parameter DVSR = 27,     // Set for 115200 Baud @ 50MH   DVSR = (System clk freq) / (16* desired Baud rate)
+    parameter DVSR_BIT = 8,  // lengtth of counter to store the DVSR number = log2(DVSR)
+    parameter FIFO_W = 5     // size of pinters in the fifo. 
+                            // 32-byte deep FIFO ; depth = 2^(FIFO_W)
+)(
+    input wire clk, rst,
+    input wire rd_uart, 
+    input wire wr_uart, 
+    input wire rx,
+    input wire [7:0] w_data,   // system sends data (byte) to out
+    output wire tx_full, // not to write the data
+    output wire rx_empty,    // 1 means not to read data
+    output wire tx,
+    output wire [7:0] r_data     // data to be read by the system from fpga
+);
+
+    wire tick;
+    wire rx_done_tick; 
+    wire tx_done_tick;
+    wire tx_empty; 
+    wire tx_fifo_not_empty;
+    wire [7:0] tx_fifo_out, rx_data_out;
+
+    mod_m_counter #(.M(DVSR), .N(DVSR_BIT)) baud_gen_unit(
+        .clk(clk), .rst(rst), .q(), .max_tick(tick)
+    );
+
+    uart_rx #(.DBIT(DBIT), .SB_TICK(SB_TICK)) uart_rx_unit(
+        .clk(clk), .rst(rst), .rx(rx), .s_tick(tick),
+        .rx_done_tick(rx_done_tick), .dout(rx_data_out)
+    );
+
+    fifo #(.B(DBIT), .W(FIFO_W)) fifo_rx_unit(
+        .clk(clk), .rst(rst), .rd(rd_uart), .wr(rx_done_tick),
+        .w_data(rx_data_out), .empty(rx_empty), .full(), .r_data(r_data)
+    );
+
+    fifo #(.B(DBIT), .W(FIFO_W)) fifo_tx_unit(
+        .clk(clk), .rst(rst), .rd(tx_done_tick), .wr(wr_uart),
+        .w_data(w_data), .empty(tx_empty), .full(tx_full), .r_data(tx_fifo_out)
+    );
+
+    uart_tx #(.DBIT(DBIT), .SB_TICK(SB_TICK)) uart_tx_unit(
+        .clk(clk), .rst(rst), .tx_start(tx_fifo_not_empty),
+        .s_tick(tick), .din(tx_fifo_out),
+        .tx_done_tick(tx_done_tick), .tx(tx)
+    );
+
+    assign tx_fifo_not_empty = ~tx_empty;
+
+endmodule`timescale 1ns / 1ps
+
+module uart_tx #(
+    parameter DBIT = 8,
+    parameter SB_TICK = 16
+)(
+    input wire clk, rst,
+    input wire tx_start, s_tick,
+    input wire [7:0] din,
+    output reg tx_done_tick,
+    output wire tx         // singe pin where data leaves 1 bit at a time
+);
+
+    localparam [1:0] idle = 2'b00, start = 2'b01, data = 2'b10, stop = 2'b11;
+    reg [1:0] state_reg, state_next;
+    reg [3:0] s_reg, s_next;
+    reg [2:0] n_reg, n_next;
+    reg [7:0] b_reg, b_next;
+    reg tx_reg, tx_next;
+
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            state_reg <= idle;
+            s_reg <= 0;
+            b_reg <= 0;
+            n_reg <= 0;
+            tx_reg <= 1;
+        end else begin
+            state_reg <= state_next;
+            s_reg <= s_next;
+            n_reg <= n_next;
+            b_reg <= b_next;
+            tx_reg <= tx_next;
+        end
+    end
+
+    always @(*) begin
+        state_next = state_reg;
+        tx_done_tick = 1'b0;
+        s_next = s_reg;
+        n_next = n_reg;
+        tx_next = tx_reg;
+        b_next = b_reg;
+
+        case (state_reg)
+            idle: begin
+                tx_next = 1'b1;
+                if (tx_start) begin
+                    state_next = start;
+                    b_next = din;
+                    s_next = 0;
+                    n_next = 0;
+                end
+            end
+            start: begin
+                tx_next = 1'b0;
+                if (s_tick) begin
+                    if (s_reg == 15) begin
+                        state_next = data;
+                        s_next = 0;
+                        n_next = 0;
+                    end else begin
+                        s_next = s_reg + 1;
+                    end
+                end
+            end
+            data: begin
+                tx_next = b_reg[0];
+                if (s_tick) begin
+                    if (s_reg == 15) begin
+                        s_next = 0;
+                        b_next = b_reg >> 1;
+                        if (n_reg == (DBIT - 1)) begin
+                            state_next = stop;
+                        end else begin
+                            n_next = n_reg + 1;
+                        end
+                    end else begin
+                        s_next = s_reg + 1;
+                    end
+                end
+            end
+            stop: begin
+                tx_next = 1'b1;
+                if (s_tick) begin
+                    if (s_reg == (SB_TICK - 1)) begin
+                        tx_done_tick = 1'b1;
+                        state_next = idle;
+                    end else begin
+                        s_next = s_reg + 1;
+                    end
+                end
+            end
+        endcase
+    end
+
+    assign tx = tx_reg;
+
+endmodule`timescale 1ns / 1ps
+
+// the uart reciever will monitor the single wire rx which translates the stream of highs and lows into an 8 bit BYtE
+// when the rx = 0 then the sequence starts
+// STart : when the line drops to 0 ; reciever counter 7 s_tick pulses cuz that puts the reciever right in the middle of the start bit
+
+
+
+module uart_rx #(
+    parameter DBIT = 8,
+    parameter SB_TICK = 16
+)(
+    input wire clk, rst,
+    input wire rx, s_tick, // rx: single pin where data enters serially (1 bit at a time)
+                            // s_tick comes from the baud rate generator
+    output reg rx_done_tick,  
+    output wire [7:0] dout
+);
+    localparam [1:0] idle = 2'b00, start = 2'b01, data = 2'b10, stop = 2'b11;
+
+    // splitting of the fsm into registors : curent state and next states
+    reg [1:0] state_reg, state_next; // keeps track of idle/start/stop/data
+    reg [3:0] s_reg, s_next;         // counts tics (0 to 15) to find the mid bit
+    reg [2:0] n_reg, n_next;        // counts how many data bits to read (0 to 7)
+    reg [7:0] b_reg, b_next;        // shift registor to collext all the incoming bits into a byte
+
+    // the controller next state 
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            state_reg <= idle;
+            s_reg <= 0;
+            n_reg <= 0;
+            b_reg <= 0;
+        end else begin
+            state_reg <= state_next;
+            s_reg <= s_next;
+            n_reg <= n_next;
+            b_reg <= b_next;
+        end
+    end
+
+    always @(*) begin
+        state_next = state_reg;
+        rx_done_tick = 1'b0;
+        s_next = s_reg;
+        n_next = n_reg;
+        b_next = b_reg;
+
+        case (state_reg)
+            idle: begin
+                if (~rx) begin  
+                    state_next = start;
+                    s_next = 0;
+                end
+            end
+            start: begin
+                if (s_tick) begin
+                    if (s_reg == 7) begin
+                        s_next = 0;
+                        n_next = 0;
+                        state_next = data;
+                    end else begin
+                        s_next = s_reg + 1;
+                    end
+                end
+            end
+            data: begin
+                if (s_tick) begin
+                    if (s_reg == 15) begin
+                        s_next = 0;
+                        b_next = {rx, b_reg[7:1]};
+                        if (n_reg == (DBIT - 1))
+                            state_next = stop;
+                        else
+                            n_next = n_reg + 1;
+                    end else begin
+                        s_next = s_reg + 1;
+                    end
+                end
+            end
+            stop: begin
+                if (s_tick) begin
+                    if (s_reg == (SB_TICK - 1)) begin
+                        rx_done_tick = 1'b1;
+                        state_next = idle;
+                    end else begin
+                        s_next = s_reg + 1;
+                    end
+                end
+            end
+        endcase
+    end
+
+    assign dout = b_reg;
+
+endmodule`timescale 1ns / 1ps
+
+module fifo #(
+    parameter B = 8,  // Width of data (8 bits)
+    parameter W = 4   // Width of pointer (4 bits = 16 words deep)
+)(
+    input wire clk, rst, rd, wr,
+    input wire [B-1:0] w_data,
+    output wire empty, full,
+    output wire [B-1:0] r_data
+);
+
+    // Memory array (2D array of regs in standard Verilog)
+    reg [B-1:0] array_reg [0:(2**W)-1]; 
+    
+    // Internal registers and wires for pointers and status
+    reg [W-1:0] w_ptr_reg, w_ptr_next, w_ptr_succ;
+    reg [W-1:0] r_ptr_reg, r_ptr_next, r_ptr_succ;
+    reg full_reg, empty_reg, full_next, empty_next;
+    wire wr_en;
+
+    // Write enable logic
+    assign wr_en = wr & ~full_reg;
+
+    // Memory Write Block (Sequential)
+    always @(posedge clk) begin
+        if (wr_en) begin
+            array_reg[w_ptr_reg] <= w_data;
+        end
+    end
+
+    // Memory Read Logic (Continuous assignment)
+    assign r_data = array_reg[r_ptr_reg]; 
+
+    // Pointer and Status Update Block (Sequential)
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            w_ptr_reg <= 0;
+            r_ptr_reg <= 0;
+            full_reg  <= 1'b0;
+            empty_reg <= 1'b1;
+        end else begin
+            w_ptr_reg <= w_ptr_next;
+            r_ptr_reg <= r_ptr_next;
+            full_reg  <= full_next;
+            empty_reg <= empty_next;
+        end
+    end
+
+    // Next-State Logic for Pointers (Combinational)
+    always @(*) begin
+        // Pre-calculate next pointer values
+        w_ptr_succ = w_ptr_reg + 1;
+        r_ptr_succ = r_ptr_reg + 1;
+        
+        // Default assignments to avoid latches
+        w_ptr_next = w_ptr_reg;
+        r_ptr_next = r_ptr_reg;
+        full_next  = full_reg;
+        empty_next = empty_reg;
+        
+        case ({wr, rd})
+            2'b01: begin // READ operation
+                if (~empty_reg) begin
+                    r_ptr_next = r_ptr_succ;
+                    full_next  = 1'b0;
+                    if (r_ptr_succ == w_ptr_reg)
+                        empty_next = 1'b1;
+                end
+            end
+            2'b10: begin // WRITE operation
+                if (~full_reg) begin
+                    w_ptr_next = w_ptr_succ;
+                    empty_next = 1'b0;
+                    if (w_ptr_succ == r_ptr_reg)
+                        full_next = 1'b1;
+                end
+            end
+            2'b11: begin // READ AND WRITE simultaneously
+                w_ptr_next = w_ptr_succ;
+                r_ptr_next = r_ptr_succ;
+            end
+            default: ; // Do nothing
+        endcase
+    end
+
+    // Output assignments
+    assign full  = full_reg;
+    assign empty = empty_reg;
+
+endmodule`timescale 1ns / 1ps
+
+module mod_m_counter #(
+    parameter M = 10,
+    parameter N = 2 
+    )(
+    input wire clk, rst,
+    output wire max_tick,
+    output wire [N-1:0] q
+);
+
+    reg [N-1:0] r_reg; // current State of the counter
+    wire [N-1:0] r_next; // next state 
+
+    always @(posedge clk or posedge rst) begin
+        if (rst)
+            r_reg <= 0;
+        else
+            r_reg <= r_next;
+    end
+    //if r_reg has reached M-1 then reset it to 0 
+
+    assign r_next = (r_reg == M - 1) ? 0 : r_reg + 1;
+    assign q = r_reg;
+    // pulse max_tick high for excatly one clock cycle when we hit the max value
+    assign max_tick = (r_reg == M - 1) ? 1'b1 : 1'b0;
+
+endmodule

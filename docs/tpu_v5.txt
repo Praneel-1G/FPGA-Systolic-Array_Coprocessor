@@ -1,0 +1,214 @@
+Yes! Exactly.
+
+Because that block starts with the word forever, it acts like a security camera that never turns off.
+
+Here is why it "runs every time" and how that works in the simulation:
+
+1. It is a "Background Thread"
+
+In Verilog, every initial block starts at Time = 0 and runs at the same time as every other block.
+
+Block A (The Master Script): This is busy sending opcodes and pixels.
+
+Block B (The Receiver): This is just sitting there, staring at the tx wire, waiting for it to wiggle.
+
+2. It is "Trigger-Based"
+
+It doesn't just run randomly. Look at this specific line:
+@(negedge tx);
+
+This is the "Trigger." The code inside that forever loop "freezes" at this line. It uses zero processing power. It just waits.
+
+As soon as the FPGA pulls the tx wire from High (1) to Low (0) to start a UART transmission, the trigger fires!
+
+The code "wakes up," records the 8 bits of that specific byte, saves it into captured[cap_idx], increments the counter, and then immediately loops back to the top to wait for the next negedge tx.
+
+3. It catches EVERY byte
+
+Because it is in a forever loop, it will catch:
+
+Result Byte 0...
+
+Result Byte 1...
+
+...all the way to Result Byte 15.
+
+It doesn't care when they arrive. If the FPGA sends them back-to-back, it catches them. If the FPGA waits an hour between bytes, it still catches them.
+
+4. Why this is better than a "regular" function:
+
+If we put the "receiving" code inside the Master Script, the script would look like this:
+
+Send Pixel 16.
+
+Receive Result 0.
+
+Receive Result 1.
+
+The Danger: If the FPGA starts sending Result 0 while the script is still finishing the "Send Pixel 16" command, the script is "busy" and would miss the start of the message.
+
+By having captured run "every time" in the background, it is impossible to miss data. It’s like having a voicemail service—even if you are busy talking to someone else, the receiver is always ready to record the incoming message.
+
+Summary
+
+Does it run every time? Yes, it is always "listening."
+
+Does it run for every byte? Yes, the forever loop ensures it resets after every byte caught.
+
+Is it automatic? Yes, it is triggered by the hardware signal (tx) itself, not by you calling a function.This table provides a cycle-by-cycle "X-Ray" of what is happening inside your FPGA during the high-speed math phase.
+
+Key for reading the table:
+
+Injection: Data entering the left side of the Systolic Array (Rows).
+
+Capture: Cleaned results dropping out of the bottom (Columns) into the Foreman’s bucket.
+
+The 6-Cycle Rule: Note that Cycle 0 Injection is finally captured as a result at Cycle 6.
+
+The TPU Math Execution Timeline
+Math Cycle	Injection (Rows 3, 2, 1, 0)	Capture (Cols 3, 2, 1, 0)	Action Summary
+0	{0, 0, 0, buf[0]}	—	Injection Starts: Row 0 receives its 1st pixel.
+1	{0, 0, buf[4], buf[1]}	—	Row 1 starts; Row 0 moves to its 2nd pixel.
+2	{0, buf[8], buf[5], buf[2]}	—	Row 2 starts; Wavefront is 3 pixels wide.
+3	{buf[12], buf[9], buf[6], buf[3]}	—	Peak Input: All rows are receiving pixels.
+4	{buf[13], buf[10], buf[7], 0}	—	Row 0 is finished; the wave starts moving right.
+5	{buf[14], buf[11], 0, 0}	—	Rows 0 and 1 finished. Data is deep in the grid.
+6	{buf[15], 0, 0, 0}	Col0 → out_buffer[0]	First Answer Drops: (R0,C0) is caught.
+7	0 (All zeros)	Col1→out[4], Col0→out[1]	Capturing (R1,C0) and (R0,C1).
+8	0	C2→out[8], C1→out[5], C0→out[2]	Capture diagonal: (R2,C0), (R1,C1), (R0,C2).
+9	0	C3→out[12], C2→out[9], C1→out[6], C0→out[3]	Peak Capture: All columns dropping results.
+10	0	C3→out[13], C2→out[10], C1→out[7]	Capturing (R1,C3), (R2,C2), (R3,C1).
+11	0	C3→out[14], C2→out[11]	Capturing (R2,C3) and (R3,C2).
+12	0	C3→out[15]	Final Answer: (R3,C3) caught. Array is empty.
+13	0	—	State Change: Move to S_TX_RESULTS.
+Detailed Breakdown of the Logic
+1. Why the "Staircase" Capture?
+
+Because you injected data row-by-row with a delay (Skewing), the results finish at different times.
+
+Column 0 starts its math at Cycle 0 and finishes its 4th calculation at Cycle 9.
+
+Column 3 doesn't even receive its first piece of data until Cycle 3, so it doesn't finish its 4th calculation until Cycle 12.
+
+2. The Structural Transpose (Mapping Col to Row)
+
+A Systolic Array naturally flips the matrix (Transposes it). Look at how the code maps the columns to the out_buffer:
+
+At Cycle 7, flat_ppu_out[15:8] (Column 1) is saved into out_buffer[4].
+
+In your grid, out_buffer[4] represents Row 1, Column 0.
+
+This specific mapping ensures that even though the hardware calculated the matrix "sideways," the bytes are stored in the correct order for the Python script to read them as a normal image block.
+
+3. The Latency Gap
+
+Notice that Injection ends at Cycle 6, but Capture continues until Cycle 12. This 6-cycle "tail" is the time required for the very last pixel (buf[15]) to:
+
+Enter the Row 3 door (Cycle 6).
+
+Multiply by the weight.
+
+Add the sum from the PE above it.
+
+Travel through the PPU's ReLU/Clamping logic.
+
+Get registered and finally appear at the Controller’s input.
+
+4. Finish Line
+
+At Cycle 13, the out_buffer is now a perfectly ordered 16-byte array. The FSM transitions to S_TX_RESULTS, and the TPU starts pushing those 16 bytes into the UART to be sent back to your screen.
+
+
+
+
++-----------------------------------------------------------------------------------+
+; Fitter Summary                                                                    ;
++---------------------------------+-------------------------------------------------+
+; Fitter Status                   ; Successful - Thu Apr 16 12:51:04 2026           ;
+; Quartus Prime Version           ; 25.1std.0 Build 1129 10/21/2025 SC Lite Edition ;
+; Revision Name                   ; top_tpu                                         ;
+; Top-level Entity Name           ; top_tpu                                         ;
+; Family                          ; Cyclone V                                       ;
+; Device                          ; 5CSXFC6D6F31C6                                  ;
+; Timing Models                   ; Final                                           ;
+; Logic utilization (in ALMs)     ; 538 / 41,910 ( 1 % )                            ;
+; Total registers                 ; 1152                                            ;
+; Total pins                      ; 4 / 499 ( < 1 % )                               ;
+; Total virtual pins              ; 0                                               ;
+; Total block memory bits         ; 0 / 5,662,720 ( 0 % )                           ;
+; Total RAM Blocks                ; 0 / 553 ( 0 % )                                 ;
+; Total DSP Blocks                ; 8 / 112 ( 7 % )                                 ;
+; Total HSSI RX PCSs              ; 0 / 9 ( 0 % )                                   ;
+; Total HSSI PMA RX Deserializers ; 0 / 9 ( 0 % )                                   ;
+; Total HSSI TX PCSs              ; 0 / 9 ( 0 % )                                   ;
+; Total HSSI PMA TX Serializers   ; 0 / 9 ( 0 % )                                   ;
+; Total PLLs                      ; 0 / 15 ( 0 % )                                  ;
+; Total DLLs                      ; 0 / 4 ( 0 % )                                   ;
++---------------------------------+-------------------------------------------------+
+
+
++-------------------------------------+
+; Slow 1100mV 85C Model Setup Summary ;
++-------+--------+--------------------+
+; Clock ; Slack  ; End Point TNS      ;
++-------+--------+--------------------+
+; clk   ; 12.772 ; 0.000              ;
++-------+--------+--------------------+
+
+
++------------------------------------+
+; Slow 1100mV 85C Model Hold Summary ;
++-------+-------+--------------------+
+; Clock ; Slack ; End Point TNS      ;
++-------+-------+--------------------+
+; clk   ; 0.199 ; 0.000              ;
++-------+-------+--------------------+
+
+
+
++-----------------------------------------------------------------------------------+
+; Flow Summary                                                                      ;
++---------------------------------+-------------------------------------------------+
+; Flow Status                     ; Successful - Thu Apr 16 12:51:21 2026           ;
+; Quartus Prime Version           ; 25.1std.0 Build 1129 10/21/2025 SC Lite Edition ;
+; Revision Name                   ; top_tpu                                         ;
+; Top-level Entity Name           ; top_tpu                                         ;
+; Family                          ; Cyclone V                                       ;
+; Device                          ; 5CSXFC6D6F31C6                                  ;
+; Timing Models                   ; Final                                           ;
+; Logic utilization (in ALMs)     ; 538 / 41,910 ( 1 % )                            ;
+; Total registers                 ; 1152                                            ;
+; Total pins                      ; 4 / 499 ( < 1 % )                               ;
+; Total virtual pins              ; 0                                               ;
+; Total block memory bits         ; 0 / 5,662,720 ( 0 % )                           ;
+; Total DSP Blocks                ; 8 / 112 ( 7 % )                                 ;
+; Total HSSI RX PCSs              ; 0 / 9 ( 0 % )                                   ;
+; Total HSSI PMA RX Deserializers ; 0 / 9 ( 0 % )                                   ;
+; Total HSSI TX PCSs              ; 0 / 9 ( 0 % )                                   ;
+; Total HSSI PMA TX Serializers   ; 0 / 9 ( 0 % )                                   ;
+; Total PLLs                      ; 0 / 15 ( 0 % )                                  ;
+; Total DLLs                      ; 0 / 4 ( 0 % )                                   ;
++---------------------------------+-------------------------------------------------+
+
++-----------------------------------------------------------------------------------+
+; Analysis & Synthesis Summary                                                      ;
++---------------------------------+-------------------------------------------------+
+; Analysis & Synthesis Status     ; Successful - Thu Apr 16 12:44:48 2026           ;
+; Quartus Prime Version           ; 25.1std.0 Build 1129 10/21/2025 SC Lite Edition ;
+; Revision Name                   ; top_tpu                                         ;
+; Top-level Entity Name           ; top_tpu                                         ;
+; Family                          ; Cyclone V                                       ;
+; Logic utilization (in ALMs)     ; N/A                                             ;
+; Total registers                 ; 1283                                            ;
+; Total pins                      ; 4                                               ;
+; Total virtual pins              ; 0                                               ;
+; Total block memory bits         ; 0                                               ;
+; Total DSP Blocks                ; 8                                               ;
+; Total HSSI RX PCSs              ; 0                                               ;
+; Total HSSI PMA RX Deserializers ; 0                                               ;
+; Total HSSI TX PCSs              ; 0                                               ;
+; Total HSSI PMA TX Serializers   ; 0                                               ;
+; Total PLLs                      ; 0                                               ;
+; Total DLLs                      ; 0                                               ;
++---------------------------------+-------------------------------------------------+
+

@@ -1,0 +1,20 @@
+# EDA Tool Junk
+*.bak
+*.vcd
+*.wlf
+work/
+transcript
+*.log
+*.rpt
+
+# Quartus Specific
+db/
+incremental_db/
+output_files/
+simulation/
+*.qws
+*.smsg
+*.summary
+*.jdi
+*.pin
+*.sld

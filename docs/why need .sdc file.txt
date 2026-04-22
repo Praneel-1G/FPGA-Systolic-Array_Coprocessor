@@ -1,0 +1,102 @@
+?? why need .sdc file 
+This file is an SDC (Synopsys Design Constraints) file.
+
+While Verilog tells the FPGA what to do, this SDC file tells the Quartus software (the compiler) how fast it must do it. Without this file, Quartus might place your math logic far apart on the chip, making the signals too slow to arrive on time.
+
+Here is the line-by-line explanation:
+
+1. Time Format
+code
+Tcl
+download
+content_copy
+expand_less
+set_time_format -unit ns -decimal_places 3
+
+This just sets the "ruler" for the file. Everything from here on is measured in nanoseconds (ns) with three decimal places of precision (e.g., 10.001).
+
+2. Creating the Clock (The Master Speed)
+code
+Tcl
+download
+content_copy
+expand_less
+create_clock -name {clk} -period 20.000 -waveform { 0.000 10.000 } [get_ports {clk}]
+
+create_clock: This is the most important command in any FPGA project. It defines the "Heartbeat."
+
+-name {clk}: We are naming this timing constraint "clk".
+
+-period 20.000: This sets the speed to 50 MHz.
+
+Math: 
+1
+/
+50
+,
+000
+,
+000
+ seconds
+=
+20
+ nanoseconds
+1/50,000,000 seconds=20 nanoseconds
+.
+
+-waveform { 0.000 10.000 }: This defines the shape of the wave. It says the clock starts at 0.000 (rises) and goes low at 10.000 (falls). This creates a perfect 50% duty cycle.
+
+[get_ports {clk}]: This tells Quartus which physical pin on the DE10-Standard board this rule applies to.
+
+3. Clock Uncertainty (The Safety Margin)
+code
+Tcl
+download
+content_copy
+expand_less
+derive_clock_uncertainty
+
+In the real world, the clock isn't perfect. There is Jitter (tiny vibrations in time) and Skew (the time it takes the clock signal to travel across the chip).
+
+This command tells Quartus: "Calculate all the imperfections and safety margins for this specific Cyclone V chip automatically." It adds a tiny bit of "padding" to the timing requirements so the design is robust.
+
+4. False Paths (The "Don't Care" Zones)
+
+A False Path is a signal path where the exact nanosecond timing doesn't matter. By marking these, you tell Quartus: "Don't waste your energy trying to make these signals fast; focus your power on the Systolic Array math instead."
+
+A. The Reset Button
+code
+Tcl
+download
+content_copy
+expand_less
+set_false_path -from [get_ports {rst}] -to *
+
+rst is a physical button you press with your finger.
+
+Why is it a False Path? A human finger is incredibly slow. A button press lasts for millions of nanoseconds. Since the FPGA operates in 20ns cycles, it is impossible for a human to be "out of sync" with the timing. Quartus should not try to optimize this path.
+
+B. UART RX and TX
+code
+Tcl
+download
+content_copy
+expand_less
+set_false_path -from [get_ports {rx}] -to *
+set_false_path -from * -to [get_ports {tx}]
+
+Why are these False Paths? UART is Asynchronous.
+
+The data coming into the rx pin from your computer isn't locked to the FPGA's 50MHz clock.
+
+Your uart_rx.sv module handles this by "oversampling" (sampling 16 times per bit).
+
+Because the UART module is designed to handle "un-timed" data, we tell the Quartus compiler: "Don't worry about the exact arrival time of bits on the rx pin. Just make sure the internal math logic hits the 50MHz target."
+
+Summary: Why do you need this file?
+
+If you didn't have this file, Quartus would be "lazy." It might place your mac_pe multipliers on opposite ends of the FPGA. Then, when a signal tries to travel from Row 0 to Row 1, it might take 25ns to get there.
+
+Since your clock is ticking every 20ns, the signal would arrive late, and your matrix math would be wrong (data corruption).
+
+This file forces Quartus to ensure that every single path inside your TPU is shorter than 20 nanoseconds. If it can't achieve that, it will give you a "Timing Violation" error during compilation, warning you that the hardware will fail before you even dump it to the FPGA.
