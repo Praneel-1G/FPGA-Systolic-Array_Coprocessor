@@ -18,3 +18,8 @@ simulation/
 *.jdi
 *.pin
 *.sld
+#Python Junk
+__pycache__/
+*.pyc 
+*.venv/
+venv/
